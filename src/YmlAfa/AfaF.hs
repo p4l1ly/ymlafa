@@ -90,8 +90,8 @@ separateTerminals node
 type RefOrTerminal f a = Either Int (f a)
 
 collect
-  :: Either (f (RefOrTerminal f a)) (f a)
-  -> State (Int, [f (RefOrTerminal f a)]) (RefOrTerminal f a)
+  :: (Monad m) => Either (f (RefOrTerminal f a)) (f a)
+  -> StateT (Int, [f (RefOrTerminal f a)]) m (RefOrTerminal f a)
 collect (Right x) = return$ Right x
 collect (Left node) = do
   i <- state$ \(i, nodes) -> (i, (i + 1, node : nodes))
@@ -163,16 +163,29 @@ treeDagCata arr alg = c where
 
 -- examples ----------------------------------------------------------------------------
 
-broken ::
+broken_consed ::
   ( [RefOrTerminal SumExprF ()]
-  , HashState (SumExprF (RefOrTerminal SumExprF ()))
+  , [SumExprF (RefOrTerminal SumExprF ())]
   )
-broken
-  = runST
+broken_consed
+  = second struct_list
+  $ runST
   $ flip runStateT hashState_empty
   $ connect'
   $ flip map [sumExpr_graph_fromRef 0, sumExpr_graph]
   $ \g arr -> treeDagCata arr (hashCons . separateTerminals) g
+
+broken ::
+  ( [RefOrTerminal SumExprF ()]
+  , [SumExprF (RefOrTerminal SumExprF ())]
+  )
+broken
+  = second snd
+  $ runST
+  $ flip runStateT (0, [])
+  $ connect'
+  $ flip map [sumExpr_graph_fromRef 0, sumExpr_graph]
+  $ \g arr -> treeDagCata arr (collect . separateTerminals) g
 
 
 data FormulaF rec
