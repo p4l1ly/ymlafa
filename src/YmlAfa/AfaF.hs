@@ -1,28 +1,45 @@
 {-# LANGUAGE DeriveFunctor, DeriveTraversable, DeriveFoldable, FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DerivingStrategies, DerivingVia #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE RankNTypes #-}
 
 module YmlAfa.AfaF where
 
 import Debug.Trace
 
-import Control.Arrow ((&&&))
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as M
+
+import GHC.Generics
+import Control.Arrow
 import Control.Monad
+import Control.Monad.Identity
+import Control.Monad.ST
+import Control.Monad.Reader
 import Control.Monad.State.Lazy
 import Data.Either
+import Data.Function.Apply
 import Data.Functor.Foldable
 import qualified Data.Functor.Foldable as RS
 import Data.Functor.Compose
 import Data.Foldable
-
+import Data.Hashable
+import Data.Functor.Classes
 import Data.Array.IArray
+import Data.Array.ST
+
+import Generic.Data (gliftEq, gshowsPrec, gliftShowsPrec)
+import Data.Hashable.Lifted
+import Generic.Data.Orphans
 
 
 type TreeGraphF f ref = Compose (Either ref) f
 type TreeGraph f ref = Fix (TreeGraphF f ref)
-
-type Formula = Fix FormulaF
-
 
 toTree
   :: Functor f
@@ -32,7 +49,6 @@ toTree
 toTree fromRef = cata$ \case
   Compose (Left ref) -> toTree fromRef$ fromRef ref
   Compose (Right x) -> Fix x
-
 
 cachedCata
   :: forall f m ref a. (Traversable f, Monad m)
@@ -55,7 +71,6 @@ cachedCata fromRef algebra = helper where
     x' <- traverse helper x
     return$ algebra x'
 
-
 cachedCata_bottomUp
   :: (Functor f, Ix ix, Ix ix, IArray arr a, Functor (arr ix))
   => (f a -> a)
@@ -67,117 +82,12 @@ cachedCata_bottomUp alg xs bounds = result where
     Compose (Left ref) -> result ! ref
     Compose (Right x) -> alg x
 
--- examples ----------------------------------------------------------------------------
-
-data FormulaF rec
-  = And [rec]
-  | Or [rec]
-  | Not rec
-  | Q Int
-  | A Int
-  | T
-  | F
-  deriving (Functor, Foldable, Traversable)
-
-data SumExprF rec
-  = Val Int
-  | Plus rec rec
-  deriving (Functor, Foldable, Traversable, Show)
-
-breakSumExpr :: SumExpr -> [SumExprF Int]
-breakSumExpr = cata$ \case
-  Val x -> [Val x]
-  Plus c1 c2 ->
-    let l1 = length c1
-        l2 = length c2
-    in c1 ++ map (fmap (+ l1)) c2 ++ [Plus (l1 - 1) (l1 + l2 - 1)]
-
-
-breakF :: forall f. (Traversable f) => Fix f -> [f Int]
-breakF = cata alg where
-  alg :: f [f Int] -> [f Int]
-  alg node
-    | null childs = [fmap undefined node]
-    | otherwise = concat childs' ++ [node']
-    where
-      node' = evalState (traverse (\_ -> state (head &&& tail)) node) offsets
-
-      childs = toList node
-      lengths = map length childs
-      offsets = scanl (+) 0 lengths
-      childs' = zipWith (\o -> map$ fmap (+ o)) offsets childs
-
-
-type TerminalOrParts f a = Either [f (Either Int (f a))] (f a)
-
--- | This is a parallelizable yet less efficient version of "breakF'state"
-breakF' :: forall f a. (Traversable f) => Fix f -> TerminalOrParts f a
-breakF' = cata alg where
-  alg :: f (TerminalOrParts f a) -> TerminalOrParts f a
-  alg node
-    | null childs = Right (fmap undefined node)
-    | otherwise = Left (concat (lefts childs') ++ [node'])
-    where
-      node' :: f (Either Int (f a))
-      node' = evalState (traverse (\x -> state (setRef x . head &&& tail)) node) offsets
-
-      setRef :: TerminalOrParts f a -> Int -> Either Int (f a)
-      setRef (Right terminal) o = Right terminal
-      setRef (Left _) o = Left o
-
-      childs = toList node :: [TerminalOrParts f a]
-
-      lengths :: [Int]
-      lengths = flip map childs$ \case
-        Left terminal -> 0
-        Right parts -> length parts
-
-      offsets = scanl (+) 0 lengths
-
-      childs' :: [TerminalOrParts f a]
-      childs' = zipWith offsetRefs offsets childs
-
-      offsetRefs :: Int -> TerminalOrParts f a -> TerminalOrParts f a
-      offsetRefs o = \case
-        x@(Right _) -> x
-        (Left childs) -> Left$ flip map childs$ fmap$ \case
-          (Left ref) -> Left$ ref + o
-          x@_ -> x
-
-type TerminalOrParts' f a = Either (Int, [f (Either Int (f a))]) (f a)
-
-breakF'state :: forall f a. (Traversable f)
-  => Fix f -> State Int (TerminalOrParts' f a)
-breakF'state tree = cataM alg tree where
-  alg :: f (TerminalOrParts' f a) -> State Int (TerminalOrParts' f a)
-  alg node
-    | null childs = return$ Right (fmap undefined node)
-    | otherwise = do
-      ix <- state$ id &&& succ
-      return$ Left (ix, concat (map snd$ lefts childs) ++ [node'])
-    where
-      node' :: f (Either Int (f a))
-      node' = fmap setRef node
-
-      setRef (Right terminal) = Right terminal
-      setRef (Left (ix, _)) = Left ix
-
-      childs = toList node :: [TerminalOrParts' f a]
-
-
-type RefOrTerminal f a = Either Int (f a)
-
-cataM :: (Monad m, Traversable (Base t), Recursive t)
-  => (Base t a -> m a) -> t ->  m a
-cataM alg = c where
-  c = alg <=< traverse c . project
-
-breakAlg :: (Functor f, Foldable f)
-  => f (RefOrTerminal f a)
-  -> Either (f (RefOrTerminal f a)) (f a)
-breakAlg node
+separateTerminals :: (Functor f, Foldable f) => f b -> Either (f b) (f a)
+separateTerminals node
   | null (toList node) = Right (fmap undefined node)
   | otherwise = Left node
+
+type RefOrTerminal f a = Either Int (f a)
 
 collect
   :: Either (f (RefOrTerminal f a)) (f a)
@@ -187,44 +97,130 @@ collect (Left node) = do
   i <- state$ \(i, nodes) -> (i, (i + 1, node : nodes))
   return$ Left i
 
-breakF'collect :: (Traversable (Base t), Recursive t)
-  => t
-  -> State (Int, [(Base t) (RefOrTerminal (Base t) a)]) (RefOrTerminal (Base t) a)
-breakF'collect = cataM (collect . breakAlg)
+data HashState a = HashState
+  { next_ix :: Int
+  , struct_list :: [a]
+  , struct_hash :: HashMap a Int
+  }
+  deriving Show
 
-breakF'monad :: forall f a. (Traversable f)
-  => Fix f -> State Int (TerminalOrParts' f a)
-breakF'monad tree = cataM alg tree where
-  alg :: f (TerminalOrParts' f a) -> State Int (TerminalOrParts' f a)
-  alg node
-    | null childs = return$ Right (fmap undefined node)
-    | otherwise = do
-      ix <- state$ id &&& succ
-      return$ Left (ix, concat (map snd$ lefts childs) ++ [node'])
-    where
-      node' :: f (Either Int (f a))
-      node' = fmap setRef node
+hashState_empty = HashState 0 [] M.empty
 
-      setRef (Right terminal) = Right terminal
-      setRef (Left (ix, _)) = Left ix
+hashCons
+  :: (Eq (f (RefOrTerminal f a)), Hashable (f (RefOrTerminal f a)), Monad m)
+  => Either (f (RefOrTerminal f a)) (f a)
+  -> StateT (HashState (f (RefOrTerminal f a))) m (RefOrTerminal f a)
+hashCons (Right x) = return$ Right x
+hashCons (Left node) = do
+  HashState next_ix struct_list struct_hash <- get
 
-      childs = toList node :: [TerminalOrParts' f a]
+  let ((result, mod), hash) = M.alterF-$ node-$ struct_hash$ \case
+        old@(Just ix) -> ((ix, HashState next_ix struct_list), old)
+        _ -> ((next_ix, HashState (next_ix + 1) (node : struct_list)), Just next_ix)
 
+  put$ mod hash
+  return$ Left result
+
+type Either' ref f a = ((Compose (Either ref) f) a)
+type RefArr s a = STArray s Int a
+
+connect
+  :: (MonadTrans t, Monad (t (ST s)))
+  => RefArr s a
+  -> [RefArr s a -> (t (ST s)) a]
+  -> (t (ST s)) [a]
+connect arr actions =
+  forM (zip [0..] actions)$ \(i, action) -> do
+    x <- action arr
+    lift$ writeArray arr i x
+    return x
+
+connect'
+  :: (MonadTrans t, Monad (t (ST s)))
+  => [RefArr s a -> (t (ST s)) a]
+  -> t (ST s) [a]
+connect' actions = do
+  arr <- lift$ newArray_ (0, length actions - 1)
+  connect arr actions
+
+-- | TODO It should be possible to generalize it to arrows. Or even more...
+cataM :: (Monad m, Traversable (Base t), Recursive t)
+  => (Base t a -> m a) -> t -> m a
+cataM alg = c where
+  c = alg <=< traverse c . project
+
+treeDagCata
+  :: forall f t s ref a. (Traversable f, MonadTrans t, Monad (t (ST s)), Ix ref)
+  => STArray s ref a
+  -> (f a -> t (ST s) a)
+  -> TreeGraph f ref
+  -> t (ST s) a
+treeDagCata arr alg = c where
+  c (Fix (Compose (Left ref))) = lift$ readArray arr ref
+  c (Fix (Compose (Right tree))) = traverse c tree >>= alg
+
+
+
+-- examples ----------------------------------------------------------------------------
+
+broken ::
+  ( [RefOrTerminal SumExprF ()]
+  , HashState (SumExprF (RefOrTerminal SumExprF ()))
+  )
+broken
+  = runST
+  $ flip runStateT hashState_empty
+  $ connect'
+  $ flip map [sumExpr_graph_fromRef 0, sumExpr_graph]
+  $ \g arr -> treeDagCata arr (hashCons . separateTerminals) g
+
+
+data FormulaF rec
+  = And [rec]
+  | Or [rec]
+  | Not rec
+  | Q Int
+  | A Int
+  | T
+  | F
+  deriving
+    (Functor, Foldable, Traversable, Show, Eq, Generic, Hashable, Generic1, Hashable1)
+
+type Formula = Fix FormulaF
+
+data SumExprF rec
+  = Val Int
+  | Plus rec rec
+  deriving
+    (Functor, Foldable, Traversable, Show, Eq, Generic, Hashable, Generic1, Hashable1)
+
+instance Eq1 SumExprF where
+  liftEq = gliftEq
+
+instance Show1 SumExprF where
+  liftShowsPrec = gliftShowsPrec
+
+breakSumExpr :: SumExpr -> [SumExprF Int]
+breakSumExpr = cata$ \case
+  Val x -> [Val x]
+  Plus c1 c2 ->
+    let l1 = length c1
+        l2 = length c2
+    in c1 ++ map (fmap (+ l1)) c2 ++ [Plus (l1 - 1) (l1 + l2 - 1)]
 
 type SumExpr = Fix SumExprF
 
 val :: Int -> SumExpr
 val = Fix . Val
 
-(+++) :: SumExpr -> SumExpr -> SumExpr
-(+++) a b = Fix$ Plus a b
+(+^+) :: SumExpr -> SumExpr -> SumExpr
+(+^+) a b = Fix$ Plus a b
 
 gval :: Int -> SumExprGraph
 gval = Fix . Compose . Right . Val
 
 gref :: Int -> SumExprGraph
 gref = Fix . Compose . Left
-
 
 (+.+) :: SumExprGraph -> SumExprGraph -> SumExprGraph
 (+.+) a b = Fix$ Compose$ Right$ Plus a b
@@ -234,18 +230,15 @@ sumAlg = \case
   Val x -> x
   Plus x y -> traceShow (x, y)$ x + y
 
-foo :: SumExpr
-foo = val 3 +++ val 4
-
 sumExpr_tree :: SumExpr
-sumExpr_tree = (val 3 +++ (val 2 +++ val 2)) +++ (val 2 +++ val 2)
+sumExpr_tree = (val 3 +^+ (val 2 +^+ val 2)) +^+ (val 2 +^+ val 2)
 
 type SumExprGraph = TreeGraph SumExprF Int
 
 unwrap (Fix x) = x
 
 sumExpr_graph :: SumExprGraph
-sumExpr_graph = ((gval 3 +.+ gval 4) +.+ (gref 0)) +.+ (gref 0)
+sumExpr_graph = (gval 3 +.+ gref 0) +.+ (gval 3 +.+ gref 0)
 
 sumExpr_graph_fromRef :: Int -> SumExprGraph
 sumExpr_graph_fromRef 0 = gval 2 +.+ gval 2
