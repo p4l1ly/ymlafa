@@ -16,12 +16,13 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as M
 
 import GHC.Generics
-import Control.Arrow
 import Control.Monad
 import Control.Monad.Identity
 import Control.Monad.ST
 import Control.Monad.Reader
 import Control.Monad.State.Lazy
+import Data.Bifunctor
+import Data.Bitraversable
 import Data.Either
 import Data.Function.Apply
 import Data.Functor.Foldable
@@ -50,13 +51,13 @@ toTree fromRef = cata$ \case
   Compose (Left ref) -> toTree fromRef$ fromRef ref
   Compose (Right x) -> Fix x
 
-cachedCata
+treeDag_cataM_unsorted
   :: forall f m ref a. (Traversable f, Monad m)
   => (ref -> (TreeGraph f ref, m (Maybe a), a -> m ()))
-  -> (f a -> a)
+  -> (f a -> m a)
   -> TreeGraph f ref
   -> m a
-cachedCata fromRef algebra = helper where
+treeDag_cataM_unsorted fromRef algebra = helper where
   helper :: TreeGraph f ref -> m a
   helper (Fix (Compose (Left ref))) =
     let (child, read, write) = fromRef ref in do
@@ -69,15 +70,15 @@ cachedCata fromRef algebra = helper where
           return result
   helper (Fix (Compose (Right x))) = do
     x' <- traverse helper x
-    return$ algebra x'
+    algebra x'
 
-cachedCata_bottomUp
+treeDag_cata
   :: (Functor f, Ix ix, Ix ix, IArray arr a, Functor (arr ix))
   => (f a -> a)
-  -> [TreeGraph f ix]  -- ^ must be topologically sorted
+  -> [TreeGraph f ix]
   -> (ix, ix)
   -> arr ix a
-cachedCata_bottomUp alg xs bounds = result where
+treeDag_cata alg xs bounds = result where
   result = listArray bounds$ flip map xs$ cata$ \case
     Compose (Left ref) -> result ! ref
     Compose (Right x) -> alg x
@@ -87,15 +88,15 @@ separateTerminals node
   | null (toList node) = Right (fmap undefined node)
   | otherwise = Left node
 
+withFst :: (Applicative f, Bitraversable t) => (a -> f c) -> t a b -> f (t c b)
+withFst action = bisequence . bimap action pure
+
 type RefOrTerminal f a = Either Int (f a)
 
-collect
-  :: (Monad m) => Either (f (RefOrTerminal f a)) (f a)
-  -> StateT (Int, [f (RefOrTerminal f a)]) m (RefOrTerminal f a)
-collect (Right x) = return$ Right x
-collect (Left node) = do
-  i <- state$ \(i, nodes) -> (i, (i + 1, node : nodes))
-  return$ Left i
+collect :: (Monad m) => a -> StateT (Int, [a]) m Int
+collect a = do
+  i <- state$ \(i, as) -> (i, (i + 1, a : as))
+  return i
 
 data HashState a = HashState
   { next_ix :: Int
@@ -106,22 +107,17 @@ data HashState a = HashState
 
 hashState_empty = HashState 0 [] M.empty
 
-hashCons
-  :: (Eq (f (RefOrTerminal f a)), Hashable (f (RefOrTerminal f a)), Monad m)
-  => Either (f (RefOrTerminal f a)) (f a)
-  -> StateT (HashState (f (RefOrTerminal f a))) m (RefOrTerminal f a)
-hashCons (Right x) = return$ Right x
-hashCons (Left node) = do
+hashCons :: (Eq a, Hashable a, Monad m) => a -> StateT (HashState a) m Int
+hashCons a = do
   HashState next_ix struct_list struct_hash <- get
 
-  let ((result, mod), hash) = M.alterF-$ node-$ struct_hash$ \case
+  let ((result, mod), hash) = M.alterF-$ a-$ struct_hash$ \case
         old@(Just ix) -> ((ix, HashState next_ix struct_list), old)
-        _ -> ((next_ix, HashState (next_ix + 1) (node : struct_list)), Just next_ix)
+        _ -> ((next_ix, HashState (next_ix + 1) (a : struct_list)), Just next_ix)
 
   put$ mod hash
-  return$ Left result
+  return result
 
-type Either' ref f a = ((Compose (Either ref) f) a)
 type RefArr s a = STArray s Int a
 
 connect
@@ -135,57 +131,54 @@ connect arr actions =
     lift$ writeArray arr i x
     return x
 
-connect'
+connectWithArr
   :: (MonadTrans t, Monad (t (ST s)))
   => [RefArr s a -> (t (ST s)) a]
   -> t (ST s) [a]
-connect' actions = do
+connectWithArr actions = do
   arr <- lift$ newArray_ (0, length actions - 1)
   connect arr actions
 
--- | TODO It should be possible to generalize it to arrows. Or even more...
-cataM :: (Monad m, Traversable (Base t), Recursive t)
-  => (Base t a -> m a) -> t -> m a
-cataM alg = c where
-  c = alg <=< traverse c . project
-
-treeDagCata
+treeDag_cataM
   :: forall f t s ref a. (Traversable f, MonadTrans t, Monad (t (ST s)), Ix ref)
   => STArray s ref a
   -> (f a -> t (ST s) a)
   -> TreeGraph f ref
   -> t (ST s) a
-treeDagCata arr alg = c where
-  c (Fix (Compose (Left ref))) = lift$ readArray arr ref
-  c (Fix (Compose (Right tree))) = traverse c tree >>= alg
+treeDag_cataM arr alg = helper where
+  helper (Fix (Compose (Left ref))) = lift$ readArray arr ref
+  helper (Fix (Compose (Right tree))) = traverse helper tree >>= alg
 
-
+cataM :: (Monad m, Traversable (Base t), Recursive t)
+  => (Base t a -> m a) -> t -> m a
+cataM alg = c where
+  c = alg <=< traverse c . project
 
 -- examples ----------------------------------------------------------------------------
 
 broken_consed ::
-  ( [RefOrTerminal SumExprF ()]
-  , [SumExprF (RefOrTerminal SumExprF ())]
+  ( [Either Int (SumExprF ())]
+  , [SumExprF (Either Int (SumExprF ()))]
   )
 broken_consed
   = second struct_list
   $ runST
   $ flip runStateT hashState_empty
-  $ connect'
+  $ connectWithArr
   $ flip map [sumExpr_graph_fromRef 0, sumExpr_graph]
-  $ \g arr -> treeDagCata arr (hashCons . separateTerminals) g
+  $ \g arr -> treeDag_cataM arr (withFst hashCons . separateTerminals) g
 
 broken ::
-  ( [RefOrTerminal SumExprF ()]
-  , [SumExprF (RefOrTerminal SumExprF ())]
+  ( [Either Int (SumExprF ())]
+  , [SumExprF (Either Int (SumExprF ()))]
   )
 broken
   = second snd
   $ runST
   $ flip runStateT (0, [])
-  $ connect'
+  $ connectWithArr
   $ flip map [sumExpr_graph_fromRef 0, sumExpr_graph]
-  $ \g arr -> treeDagCata arr (collect . separateTerminals) g
+  $ \g arr -> treeDag_cataM arr (withFst collect . separateTerminals) g
 
 
 data FormulaF rec
@@ -263,4 +256,6 @@ sumExpr_graph_fromRef'
 sumExpr_graph_fromRef' _ = (gval 2 +.+ gval 2, get, put . Just)
 
 run :: Int
-run = evalState (cachedCata sumExpr_graph_fromRef' sumAlg sumExpr_graph) Nothing
+run = evalState
+  (treeDag_cataM_unsorted sumExpr_graph_fromRef' (return . sumAlg) sumExpr_graph)
+  Nothing
